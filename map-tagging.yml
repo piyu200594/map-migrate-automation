@@ -1,0 +1,128 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Automates tagging of all newly created resources with map-migrate: mig12345"
+
+Resources:
+
+  ## IAM Role for Lambda Execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaTaggingRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaTaggingPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:CreateTags"
+                  - "rds:AddTagsToResource"
+                  - "s3:PutBucketTagging"
+                  - "lambda:TagResource"
+                  - "events:PutTargets"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+
+  ## Lambda Function to Apply Tags
+  AutoTagLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AutoTaggingLambda
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              tag_key = "map-migrate"
+              tag_value = "mig12345"
+              
+              detail = event.get("detail", {})
+              service = detail.get("eventSource", "").split(".")[0]
+              
+              if service == "ec2":
+                  items = detail.get("responseElements", {}).get("instancesSet", {}).get("items", [])
+                  ec2 = boto3.client("ec2")
+                  for item in items:
+                      instance_id = item.get("instanceId")
+                      if instance_id:
+                          ec2.create_tags(Resources=[instance_id], Tags=[{"Key": tag_key, "Value": tag_value}])
+              
+              elif service == "rds":
+                  resource_id = detail.get("responseElements", {}).get("dBInstanceArn")
+                  if resource_id:
+                      rds = boto3.client("rds")
+                      rds.add_tags_to_resource(ResourceName=resource_id, Tags=[{"Key": tag_key, "Value": tag_value}])
+              
+              elif service == "s3":
+                  bucket_name = detail.get("requestParameters", {}).get("bucketName")
+                  if bucket_name:
+                      s3 = boto3.client("s3")
+                      s3.put_bucket_tagging(
+                          Bucket=bucket_name,
+                          Tagging={"TagSet": [{"Key": tag_key, "Value": tag_value}]}
+                      )
+
+              return {"status": "success"}
+
+  ## EventBridge Rule to Trigger Lambda on Resource Creation
+  TaggingEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: TaggingNewResources
+      Description: "Triggers Lambda when new EC2, RDS, or S3 resources are created"
+      EventPattern:
+        {
+          "detail-type": ["AWS API Call via CloudTrail"],
+          "detail": {
+            "eventSource": [
+              "ec2.amazonaws.com",
+              "rds.amazonaws.com",
+              "s3.amazonaws.com"
+            ],
+            "eventName": [
+              "RunInstances",
+              "CreateDBInstance",
+              "CreateBucket"
+            ]
+          }
+        }
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AutoTagLambda.Arn
+          Id: "AutoTaggingLambdaTarget"
+
+  ## Permission for EventBridge to Invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AutoTagLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt TaggingEventRule.Arn
+
+Outputs:
+  LambdaFunction:
+    Description: "Lambda Function ARN"
+    Value: !GetAtt AutoTagLambda.Arn
+  EventRule:
+    Description: "EventBridge Rule Name"
+    Value: !Ref TaggingEventRule
